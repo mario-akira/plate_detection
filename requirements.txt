@@ -1,0 +1,6 @@
+ultralytics>=8.3
+opencv-python
+numpy
+tensorflow      # usado pelo export TFLite e como interpretador no PC
+ethos-u-vela    # otimização para a NPU Ethos-U55 do Grove Vision AI V2
+kaggle          # opcional: baixar o dataset car-plate-detection pela linha de comando
