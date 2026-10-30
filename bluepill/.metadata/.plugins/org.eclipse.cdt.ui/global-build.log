@@ -1,0 +1,112 @@
+12:13:09 **** Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-gcc -mcpu=cortex-m3 -g3 -DDEBUG -c -x assembler-with-cpp -MMD -MP -MF"Startup/startup_stm32f103c8tx.d" -MT"Startup/startup_stm32f103c8tx.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Startup/startup_stm32f103c8tx.o" "../Startup/startup_stm32f103c8tx.s"
+arm-none-eabi-gcc "../Src/grove_at.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/grove_at.d" -MT"Src/grove_at.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/grove_at.o"
+arm-none-eabi-gcc "../Src/main.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/main.d" -MT"Src/main.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/main.o"
+arm-none-eabi-gcc "../Src/syscalls.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/syscalls.d" -MT"Src/syscalls.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/syscalls.o"
+arm-none-eabi-gcc "../Src/sysmem.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/sysmem.d" -MT"Src/sysmem.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/sysmem.o"
+../Src/main.c:23:10: fatal error: main.h: No such file or directory
+   23 | #include "main.h"
+      |          ^~~~~~~~
+compilation terminated.
+make: *** [Src/subdir.mk:28: Src/main.o] Error 1
+make: *** Waiting for unfinished jobs....
+"make -j12 all" terminated with exit code 2. Build might be incomplete.
+12:17:49 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-gcc "../Src/main.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/main.d" -MT"Src/main.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/main.o"
+arm-none-eabi-gcc -o "grove_control.elf" @"objects.list"   -mcpu=cortex-m3 -T"/home/mario/repositories/plate_detection/bluepill/grove_control/STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="grove_control.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Finished building target: grove_control.elf
+ 
+arm-none-eabi-size  grove_control.elf 
+arm-none-eabi-objdump -h -S grove_control.elf  > "grove_control.list"
+   text	   data	    bss	    dec	    hex	filename
+   6884	     80	   3704	  10668	   29ac	grove_control.elf
+Finished building: default.size.stdout
+ 
+Finished building: grove_control.list
+ 
+12:19:50 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-size  grove_control.elf 
+   text	   data	    bss	    dec	    hex	filename
+   6884	     80	   3704	  10668	   29ac	grove_control.elf
+Finished building: default.size.stdout
+ 
+12:24:06 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-size  grove_control.elf 
+   text	   data	    bss	    dec	    hex	filename
+   6884	     80	   3704	  10668	   29ac	grove_control.elf
+Finished building: default.size.stdout
+ 
+12:27:49 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-size  grove_control.elf 
+   text	   data	    bss	    dec	    hex	filename
+   6884	     80	   3704	  10668	   29ac	grove_control.elf
+Finished building: default.size.stdout
+ 
+12:29:03 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-gcc "../Src/main.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/main.d" -MT"Src/main.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/main.o"
+arm-none-eabi-gcc -o "grove_control.elf" @"objects.list"   -mcpu=cortex-m3 -T"/home/mario/repositories/plate_detection/bluepill/grove_control/STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="grove_control.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Finished building target: grove_control.elf
+ 
+arm-none-eabi-size  grove_control.elf 
+arm-none-eabi-objdump -h -S grove_control.elf  > "grove_control.list"
+   text	   data	    bss	    dec	    hex	filename
+   6964	     80	   3704	  10748	   29fc	grove_control.elf
+Finished building: default.size.stdout
+ 
+Finished building: grove_control.list
+ 
+12:30:07 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-size  grove_control.elf 
+   text	   data	    bss	    dec	    hex	filename
+   6964	     80	   3704	  10748	   29fc	grove_control.elf
+Finished building: default.size.stdout
+ 
+12:30:41 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-size  grove_control.elf 
+   text	   data	    bss	    dec	    hex	filename
+   6964	     80	   3704	  10748	   29fc	grove_control.elf
+Finished building: default.size.stdout
+ 
+12:30:55 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-size  grove_control.elf 
+   text	   data	    bss	    dec	    hex	filename
+   6964	     80	   3704	  10748	   29fc	grove_control.elf
+Finished building: default.size.stdout
+ 
+14:24:24 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-gcc "../Src/main.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/main.d" -MT"Src/main.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/main.o"
+arm-none-eabi-gcc -o "grove_control.elf" @"objects.list"   -mcpu=cortex-m3 -T"/home/mario/repositories/plate_detection/bluepill/grove_control/STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="grove_control.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Finished building target: grove_control.elf
+ 
+arm-none-eabi-size  grove_control.elf 
+arm-none-eabi-objdump -h -S grove_control.elf  > "grove_control.list"
+   text	   data	    bss	    dec	    hex	filename
+   7044	     80	   3712	  10836	   2a54	grove_control.elf
+Finished building: default.size.stdout
+ 
+Finished building: grove_control.list
+ 
+14:26:51 **** Incremental Build of configuration Debug for project grove_control ****
+make -j12 all 
+arm-none-eabi-gcc "../Src/main.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F1 -DSTM32F103C8Tx -c -I../Inc -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/main.d" -MT"Src/main.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/main.o"
+arm-none-eabi-gcc -o "grove_control.elf" @"objects.list"   -mcpu=cortex-m3 -T"/home/mario/repositories/plate_detection/bluepill/grove_control/STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="grove_control.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Finished building target: grove_control.elf
+ 
+arm-none-eabi-size  grove_control.elf 
+arm-none-eabi-objdump -h -S grove_control.elf  > "grove_control.list"
+   text	   data	    bss	    dec	    hex	filename
+   7328	     80	   3712	  11120	   2b70	grove_control.elf
+Finished building: default.size.stdout
+ 
+Finished building: grove_control.list
+ 

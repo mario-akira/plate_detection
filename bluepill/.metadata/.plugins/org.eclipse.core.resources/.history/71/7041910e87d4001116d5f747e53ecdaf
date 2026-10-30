@@ -1,0 +1,325 @@
+/*
+ * Blue Pill (STM32F103C8) controlando o Grove Vision AI V2 pela UART.
+ * Versão "bare metal": não precisa de HAL, CubeMX nem main.h. Funciona num
+ * projeto "Empty" do STM32CubeIDE (só este arquivo + grove_at.c + grove_at.h).
+ *
+ * A cada INTERVALO_MS pede UMA inferência ao kit (AT+INVOKE=1,0,1), lê as caixas
+ * e, quando há placa com score >= LIMIAR_SCORE:
+ *   - acende o LED do kit (AT+LED=1) e o LED da Blue Pill (PC13);
+ *   - depois de QUADROS_SEGUIDOS inferências seguidas, salva a foto no cartão SD
+ *     do kit (AT+ACTION="save_jpeg()"), no máximo uma a cada ESPERA_FOTO_MS.
+ * Se o kit não responder, conta como "nenhuma placa" e continua.
+ *
+ * Ligações (3,3 V nos dois lados):
+ *   Blue Pill PA9  (USART1 TX) -> RX do Grove Vision AI V2
+ *   Blue Pill PA10 (USART1 RX) <- TX do Grove Vision AI V2
+ *   GND <-> GND   (alimente o kit pela USB-C dele ou pelo pino de 5 V)
+ *   Opcional, log no PC: PA2 (USART2 TX) -> RX de um adaptador USB-serial, 115200 baud
+ */
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "grove_at.h"
+
+/* ------------------------------ Ajustes ------------------------------ */
+#define INTERVALO_MS      1000u   /* tempo entre inferências */
+#define LIMIAR_SCORE      65      /* confiança mínima (0-100) para contar como placa */
+#define QUADROS_SEGUIDOS  2       /* inferências seguidas acima do limiar para salvar */
+#define ESPERA_FOTO_MS    5000u   /* tempo mínimo entre fotos */
+#define LED_SEGURA_MS     2000u   /* LED fica aceso esse tempo depois da última detecção */
+#define CLASSE_PLACA      0       /* id da classe "placa" no modelo */
+#define SALVAR_NO_SD      1       /* 1 = salva foto no SD do kit; 0 = só LED */
+#define LED_MODO_SERIAL   1       /* LED da Blue Pill (PC13):
+                                     1 = pisca enquanto o kit envia dados pela serial
+                                         (o LED do kit continua indicando a placa)
+                                     0 = acende quando há placa, junto com o LED do kit */
+#define LED_SERIAL_MS     50u     /* quanto tempo o LED fica aceso após cada byte recebido */
+#define TIMEOUT_MS        3000u   /* espera máxima por cada resposta do kit */
+#define GROVE_BAUD        921600u /* velocidade padrão da UART do kit */
+#define LOG_BAUD          115200u
+/* -------------------------------------------------------------------- */
+
+/* ===================== registradores do STM32F103 (RM0008) ===================== */
+#define REG(addr) (*(volatile uint32_t *)(addr))
+
+typedef struct { volatile uint32_t CR, CFGR, CIR, APB2RSTR, APB1RSTR, AHBENR, APB2ENR, APB1ENR; } rcc_t;
+typedef struct { volatile uint32_t CRL, CRH, IDR, ODR, BSRR, BRR, LCKR; } gpio_t;
+typedef struct { volatile uint32_t SR, DR, BRR, CR1, CR2, CR3, GTPR; } usart_t;
+typedef struct { volatile uint32_t CTRL, LOAD, VAL, CALIB; } systick_t;
+
+#define RCC_R      ((rcc_t *)0x40021000u)
+#define GPIOA_R    ((gpio_t *)0x40010800u)
+#define GPIOC_R    ((gpio_t *)0x40011000u)
+#define USART1_R   ((usart_t *)0x40013800u)
+#define USART2_R   ((usart_t *)0x40004400u)
+#define SYSTICK_R  ((systick_t *)0xE000E010u)
+#define FLASH_ACR  REG(0x40022000u)
+#define NVIC_ISER1 REG(0xE000E104u)       /* habilita IRQs 32..63 */
+#define USART1_IRQ 37u
+
+/* bits */
+#define RCC_CR_HSEON    (1u << 16)
+#define RCC_CR_HSERDY   (1u << 17)
+#define RCC_CR_PLLON    (1u << 24)
+#define RCC_CR_PLLRDY   (1u << 25)
+#define RCC_CFGR_SW_PLL      (2u << 0)
+#define RCC_CFGR_SWS_MASK    (3u << 2)
+#define RCC_CFGR_SWS_PLL     (2u << 2)
+#define RCC_CFGR_PPRE1_DIV2  (4u << 8)
+#define RCC_CFGR_PLLSRC_HSE  (1u << 16)
+#define RCC_CFGR_PLLMUL9     (7u << 18)
+#define RCC_APB2_AFIO   (1u << 0)
+#define RCC_APB2_IOPA   (1u << 2)
+#define RCC_APB2_IOPC   (1u << 4)
+#define RCC_APB2_USART1 (1u << 14)
+#define RCC_APB1_USART2 (1u << 17)
+#define FLASH_ACR_LATENCY2 (2u << 0)
+#define FLASH_ACR_PRFTBE   (1u << 4)
+#define USART_SR_ORE   (1u << 3)
+#define USART_SR_RXNE  (1u << 5)
+#define USART_SR_TC    (1u << 6)
+#define USART_SR_TXE   (1u << 7)
+#define USART_CR1_RE     (1u << 2)
+#define USART_CR1_TE     (1u << 3)
+#define USART_CR1_RXNEIE (1u << 5)
+#define USART_CR1_UE     (1u << 13)
+
+#define SYSCLK_HZ 72000000u
+#define PCLK1_HZ  36000000u
+#define PCLK2_HZ  72000000u
+
+/* ============================ relógio e tempo ============================ */
+static volatile uint32_t ms_ticks;
+static volatile uint32_t last_rx_ms;          /* instante do último byte recebido do kit */
+static volatile bool     rx_led_enabled;      /* liga o indicador depois das piscadas iniciais */
+
+
+void SysTick_Handler(void)
+{
+    ms_ticks++;
+#if LED_MODO_SERIAL
+    if (rx_led_enabled) {
+        /* PC13 baixo = aceso: aceso enquanto chegam bytes, apaga LED_SERIAL_MS depois */
+        bool active = (ms_ticks - last_rx_ms) < LED_SERIAL_MS;
+        GPIOC_R->BSRR = active ? (1u << (13 + 16)) : (1u << 13);
+    }
+#endif
+}
+
+static uint32_t millis(void) { return ms_ticks; }
+
+static void delay_ms(uint32_t ms)
+{
+    uint32_t t0 = millis();
+    while (millis() - t0 < ms) {}
+}
+
+/* alguns arquivos de startup chamam SystemInit antes do main */
+void SystemInit(void) {}
+
+/* 72 MHz a partir do cristal de 8 MHz da Blue Pill */
+static void clock_init(void)
+{
+    RCC_R->CR |= RCC_CR_HSEON;
+    while (!(RCC_R->CR & RCC_CR_HSERDY)) {}
+    FLASH_ACR = FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY2;   /* 2 wait states para 72 MHz */
+    RCC_R->CFGR = RCC_CFGR_PLLSRC_HSE | RCC_CFGR_PLLMUL9 | RCC_CFGR_PPRE1_DIV2;
+    RCC_R->CR |= RCC_CR_PLLON;
+    while (!(RCC_R->CR & RCC_CR_PLLRDY)) {}
+    RCC_R->CFGR |= RCC_CFGR_SW_PLL;
+    while ((RCC_R->CFGR & RCC_CFGR_SWS_MASK) != RCC_CFGR_SWS_PLL) {}
+
+    SYSTICK_R->LOAD = SYSCLK_HZ / 1000u - 1u;            /* interrupção a cada 1 ms */
+    SYSTICK_R->VAL  = 0;
+    SYSTICK_R->CTRL = 7u;                                /* clock do núcleo, IRQ, liga */
+}
+
+/* ============================ GPIO e UARTs ============================ */
+static void gpio_mode(gpio_t *port, uint32_t pin, uint32_t mode4bits)
+{
+    volatile uint32_t *cr = (pin < 8u) ? &port->CRL : &port->CRH;
+    uint32_t shift = (pin % 8u) * 4u;
+    *cr = (*cr & ~(0xFu << shift)) | (mode4bits << shift);
+}
+#define MODE_AF_PP_50MHZ   0xBu   /* saída da UART */
+#define MODE_IN_PULL       0x8u   /* entrada com pull-up/down (ODR escolhe) */
+#define MODE_OUT_PP_2MHZ   0x2u   /* LED */
+
+static void uart_init(usart_t *u, uint32_t pclk, uint32_t baud, bool rx_irq)
+{
+    u->CR1 = 0;
+    u->BRR = (pclk + baud / 2u) / baud;   /* 72 MHz / 921600 -> 78 (923 kbaud, erro 0,16%) */
+    u->CR1 = USART_CR1_TE | USART_CR1_RE | (rx_irq ? USART_CR1_RXNEIE : 0u) | USART_CR1_UE;
+}
+
+static void uart_write(usart_t *u, const char *s)
+{
+    while (*s) {
+        while (!(u->SR & USART_SR_TXE)) {}
+        u->DR = (uint8_t)*s++;
+    }
+    while (!(u->SR & USART_SR_TC)) {}
+}
+
+void USART1_IRQHandler(void)
+{
+    uint32_t sr = USART1_R->SR;
+    if (sr & (USART_SR_RXNE | USART_SR_ORE)) {
+        grove_rx_push((uint8_t)USART1_R->DR);   /* ler SR e depois DR limpa RXNE e ORE */
+        last_rx_ms = ms_ticks;                  /* para o LED de atividade serial */
+    }
+}
+
+static void hw_init(void)
+{
+    RCC_R->APB2ENR |= RCC_APB2_AFIO | RCC_APB2_IOPA | RCC_APB2_IOPC | RCC_APB2_USART1;
+    RCC_R->APB1ENR |= RCC_APB1_USART2;
+
+    gpio_mode(GPIOA_R, 9, MODE_AF_PP_50MHZ);    /* PA9  = USART1 TX */
+    gpio_mode(GPIOA_R, 10, MODE_IN_PULL);       /* PA10 = USART1 RX */
+    gpio_mode(GPIOA_R, 2, MODE_AF_PP_50MHZ);    /* PA2  = USART2 TX (log) */
+    gpio_mode(GPIOA_R, 3, MODE_IN_PULL);        /* PA3  = USART2 RX */
+    GPIOA_R->BSRR = (1u << 10) | (1u << 3);     /* pull-up nas entradas RX */
+
+    gpio_mode(GPIOC_R, 13, MODE_OUT_PP_2MHZ);   /* PC13 = LED da Blue Pill (acende em nível baixo) */
+    GPIOC_R->BSRR = (1u << 13);                 /* começa apagado */
+
+    uart_init(USART1_R, PCLK2_HZ, GROVE_BAUD, true);
+    uart_init(USART2_R, PCLK1_HZ, LOG_BAUD, false);
+    NVIC_ISER1 = 1u << (USART1_IRQ - 32u);
+}
+
+static void log_printf(const char *fmt, ...)
+{
+    char line[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    uart_write(USART2_R, line);
+}
+
+/* ============================ comandos para o kit ============================ */
+static void grove_send(const char *cmd)
+{
+    grove_rx_flush();                           /* respostas atrasadas não contam */
+    uart_write(USART1_R, cmd);
+}
+
+/* espera uma mensagem com esse type e name; devolve true se chegou com code 0 */
+static bool grove_wait(long type, const char *name, uint32_t timeout_ms)
+{
+    uint32_t t0 = millis();
+    while (millis() - t0 < timeout_ms) {
+        if (!grove_poll_message()) continue;
+        const char *m = grove_last_message();
+        long t, code = 0;
+        if (grove_json_int(m, "type", &t) && t == type && grove_json_str_contains(m, "name", name)) {
+            grove_json_int(m, "code", &code);
+            return code == 0;
+        }
+    }
+    return false;
+}
+
+/* uma inferência; devolve o maior score da placa (0 se nada ou se o kit não respondeu) */
+static int grove_invoke(bool *ok)
+{
+    grove_send("AT+INVOKE=1,0,1\r\n");          /* 1 vez, sem filtro, só resultados (sem imagem) */
+    *ok = grove_wait(0, "INVOKE", TIMEOUT_MS) && grove_wait(1, "INVOKE", TIMEOUT_MS);
+    return *ok ? grove_best_score(grove_last_message(), CLASSE_PLACA) : 0;
+}
+
+static void grove_led(bool on)
+{
+    uart_write(USART1_R, on ? "AT+LED=1\r\n" : "AT+LED=0\r\n");   /* sem resposta */
+#if !LED_MODO_SERIAL
+    GPIOC_R->BSRR = on ? (1u << (13 + 16)) : (1u << 13);          /* PC13: baixo = aceso */
+#endif
+}
+
+static bool grove_save_jpeg(void)
+{
+    grove_send("AT+ACTION=\"save_jpeg()\"\r\n"); /* salva o quadro da próxima inferência */
+    if (!grove_wait(0, "ACTION", TIMEOUT_MS)) return false;
+    bool ok;
+    (void)grove_invoke(&ok);
+    grove_send("AT+ACTION=\"\"\r\n");            /* remove a ação */
+    grove_wait(0, "ACTION", TIMEOUT_MS);
+    return ok;
+}
+
+/* pisca o LED da Blue Pill: sinal de que o programa foi gravado e está rodando */
+static void blink_startup(int times)
+{
+    for (int i = 0; i < times; i++) {
+        GPIOC_R->BSRR = 1u << (13 + 16);        /* PC13 baixo = aceso */
+        delay_ms(150);
+        GPIOC_R->BSRR = 1u << 13;               /* apagado */
+        delay_ms(150);
+    }
+}
+
+/* ================================== main ================================== */
+int main(void)
+{
+    clock_init();
+    hw_init();
+    blink_startup(5);                           /* 5 piscadas rápidas ao ligar */
+    delay_ms(750);                              /* tempo para o kit ligar */
+    last_rx_ms = millis() - LED_SERIAL_MS;      /* começa apagado */
+    rx_led_enabled = true;                      /* a partir daqui o PC13 mostra a atividade serial */
+
+    uart_write(USART1_R, "AT+BREAK\r\n");        /* para inferência contínua deixada pelo SenseCraft */
+    delay_ms(300);
+    grove_led(false);
+    log_printf("Deteccao de placas: 1 inferencia a cada %lu ms\r\n", (unsigned long)INTERVALO_MS);
+
+    uint32_t next = millis();
+    uint32_t last_seen = 0, last_photo = 0;
+    bool seen_once = false, photo_once = false, led_on = false;
+    int seq = 0;
+
+    for (;;) {
+        while ((int32_t)(millis() - next) < 0) {}   /* espera o próximo ciclo */
+        next += INTERVALO_MS;
+
+        bool ok;
+        int score = grove_invoke(&ok);
+        uint32_t now = millis();
+
+        if (score >= LIMIAR_SCORE) {
+            seq++;
+            last_seen = now;
+            seen_once = true;
+        } else {
+            seq = 0;
+        }
+
+        bool want_led = seen_once && (now - last_seen <= LED_SEGURA_MS);
+        if (want_led != led_on) {
+            grove_led(want_led);
+            led_on = want_led;
+        }
+
+        log_printf("%s placa=%d seguidas=%d%s\r\n", ok ? "ok " : "SEM RESPOSTA", score, seq,
+                   led_on ? " LED" : "");
+
+#if SALVAR_NO_SD
+        if (seq >= QUADROS_SEGUIDOS && (!photo_once || now - last_photo >= ESPERA_FOTO_MS)) {
+            bool saved = grove_save_jpeg();
+            log_printf(saved ? ">> foto salva no SD\r\n" : ">> nao salvou (SD? firmware?)\r\n");
+            if (saved) {
+                last_photo = now;
+                photo_once = true;
+            }
+            seq = 0;
+        }
+#endif
+        if ((int32_t)(millis() - next) > (int32_t)INTERVALO_MS) {
+            next = millis();                    /* atrasou muito: não tenta compensar */
+        }
+    }
+}

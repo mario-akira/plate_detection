@@ -3,19 +3,23 @@
 YOLO tiny em TensorFlow/Keras para detectar placas de veículos (1 classe),
 com exportação para TFLite int8 + Vela (Ethos-U55) para o Grove Vision AI V2.
 
-Arquitetura (pensada para a NPU Ethos-U55):
-  - backbone MobileNetV2 (alpha 0.35, pré-treinado no ImageNet), só ReLU6
-  - neck estilo FPN com UpSampling nearest
-  - 2 escalas de detecção (stride 8 e 16) com 3 âncoras cada (k-means no dataset)
+Arquiteturas (--arch):
+  - swift (padrão): Swift-YOLO tiny da Seeed (SSCMA) = YOLOv5 com backbone
+    CSPDarknet (widen 0.15, deepen 0.33), neck PAFPN, SPPF e ReLU; treinada do zero,
+    com mosaico
+  - mobilenet: backbone MobileNetV2 (alpha 0.35, pré-treinado no ImageNet) + FPN leve
+Comum às duas (pensado para a NPU Ethos-U55):
+  - 3 escalas de detecção (stride 8, 16 e 32) com 3 âncoras cada (k-means no dataset),
+    como o firmware SSCMA do Grove Vision AI V2 exige para modelos YOLOv5
   - parametrização do YOLOv5 (só sigmoid, sem exp), atribuição com células vizinhas
   - saída exportada no formato YOLOv5: [1, N, 6] = cx, cy, w, h, obj, cls (normalizados 0..1)
 
 Uso com o dataset do Kaggle (PASCAL VOC):
     kaggle datasets download -d andrewmvd/car-plate-detection --unzip -p data/car-plate-detection
-    python train_tf.py --voc data/car-plate-detection --imgsz 192 --epochs 150
+    python train_tf.py --voc data/car-plate-detection --imgsz 192 --epochs 300
 
 Uso com um dataset já convertido (datasets/placas/images|labels/train|val):
-    python train_tf.py --data-dir datasets/placas
+    python train_tf.py --data-dir datasets/placas --out runs/swift_yolo --vela .venv-vela/bin/vela
 
 Só exportar a partir dos melhores pesos já treinados:
     python train_tf.py --data-dir datasets/placas --skip-train
@@ -47,7 +51,7 @@ from keras import layers, ops
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 PAD = 114
-STRIDES = (8, 16)
+STRIDES = (8, 16, 32)      # o firmware da Seeed (SSCMA) exige exatamente estas 3 escalas
 NUM_ANCHORS = 3
 NC = 1                      # uma classe: placa
 NO = 5 + NC                 # cx, cy, w, h, obj, cls
@@ -112,13 +116,62 @@ def random_affine(img, boxes_n, size, rng, scale=(0.35, 1.3), translate=0.2):
     M = np.array([[r, 0, tx], [0, r, ty]], np.float32)
     out = cv2.warpAffine(img, M, (size, size), flags=cv2.INTER_LINEAR, borderValue=(PAD, PAD, PAD))
     b = norm_to_xyxy(boxes_n, w0, h0) * r + np.array([tx, ty, tx, ty], np.float32)
-    if len(b):
-        area0 = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
-        b = np.clip(b, 0, size)
-        area1 = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
-        keep = ((b[:, 2] - b[:, 0]) >= 3) & ((b[:, 3] - b[:, 1]) >= 3) & (area1 >= 0.4 * area0)
-        b = b[keep]
-    return out, b
+    return out, clip_boxes(b, size)
+
+
+def clip_boxes(b, size, min_side=3, min_area_ratio=0.4):
+    """Corta as caixas na borda da imagem e descarta as que ficaram muito pequenas ou cortadas."""
+    if not len(b):
+        return np.zeros((0, 4), np.float32)
+    area0 = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    b = np.clip(b, 0, size)
+    area1 = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    keep = ((b[:, 2] - b[:, 0]) >= min_side) & ((b[:, 3] - b[:, 1]) >= min_side) & (area1 >= min_area_ratio * area0)
+    return b[keep].astype(np.float32)
+
+
+def mosaic4(items, idxs, size, rng, scale=(0.5, 1.5), translate=0.1):
+    """Mosaico do YOLOv5: junta 4 imagens numa tela 2x maior e recorta com escala/translação aleatórias.
+    Multiplica a variedade de fundos e de posições das placas, essencial treinando sem pré-treino."""
+    s = size
+    canvas = np.full((2 * s, 2 * s, 3), PAD, np.uint8)
+    xc, yc = (int(rng.uniform(0.5 * s, 1.5 * s)) for _ in range(2))
+    boxes = []
+    for k, i in enumerate(idxs):
+        img, bn, _ = items[i]
+        h0, w0 = img.shape[:2]
+        r = s / max(h0, w0)
+        img = cv2.resize(img, (max(1, int(round(w0 * r))), max(1, int(round(h0 * r)))), interpolation=cv2.INTER_LINEAR)
+        h, w = img.shape[:2]
+        if k == 0:    # cima-esquerda
+            x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+        elif k == 1:  # cima-direita
+            x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, 2 * s), yc
+            x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+        elif k == 2:  # baixo-esquerda
+            x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(2 * s, yc + h)
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+        else:         # baixo-direita
+            x1a, y1a, x2a, y2a = xc, yc, min(xc + w, 2 * s), min(2 * s, yc + h)
+            x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+        canvas[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
+        b = norm_to_xyxy(bn, w0, h0) * r
+        if len(b):
+            b += np.array([x1a - x1b, y1a - y1b] * 2, np.float32)
+            # só a parte da caixa que caiu dentro do pedaço colado
+            b[:, [0, 2]] = np.clip(b[:, [0, 2]], x1a, x2a)
+            b[:, [1, 3]] = np.clip(b[:, [1, 3]], y1a, y2a)
+            boxes.append(b)
+    b = np.concatenate(boxes) if boxes else np.zeros((0, 4), np.float32)
+    b = b[((b[:, 2] - b[:, 0]) > 2) & ((b[:, 3] - b[:, 1]) > 2)]
+
+    sc = rng.uniform(*scale)
+    tx = s / 2 - sc * s + rng.uniform(-translate, translate) * s   # centro da tela -> centro da saída
+    ty = s / 2 - sc * s + rng.uniform(-translate, translate) * s
+    M = np.array([[sc, 0, tx], [0, sc, ty]], np.float32)
+    out = cv2.warpAffine(canvas, M, (s, s), flags=cv2.INTER_LINEAR, borderValue=(PAD, PAD, PAD))
+    return out, clip_boxes(b * sc + np.array([tx, ty, tx, ty], np.float32), s)
 
 
 def hsv_jitter(img, rng, gh=0.015, gs=0.6, gv=0.5):
@@ -137,7 +190,7 @@ def to_input(bgr):
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
 
-def kmeans_anchors(items, size, n=2 * NUM_ANCHORS, iters=300, seed=0):
+def kmeans_anchors(items, size, n=len(STRIDES) * NUM_ANCHORS, iters=300, seed=0):
     """Âncoras (em pixels na entrada do modelo) por k-means com distância 1-IoU."""
     wh = []
     for img, b, _ in items:
@@ -148,7 +201,8 @@ def kmeans_anchors(items, size, n=2 * NUM_ANCHORS, iters=300, seed=0):
     wh = np.concatenate(wh) if wh else np.zeros((0, 2))
     if len(wh) < n:
         print("[âncoras] poucas caixas, usando âncoras padrão")
-        base = np.array([[12, 6], [20, 9], [30, 13], [44, 18], [64, 26], [96, 40]], np.float32)
+        base = np.array([[10, 5], [16, 7], [22, 10], [30, 13], [40, 17], [54, 22],
+                         [72, 30], [100, 42], [140, 60]], np.float32)
         return (base * size / 192).reshape(len(STRIDES), NUM_ANCHORS, 2)
 
     def wh_iou(a, c):
@@ -208,19 +262,25 @@ def build_targets(boxes, size, anchors):
     return outs
 
 
-def batch_generator(items, size, anchors, batch, augment, seed):
+def batch_generator(items, size, anchors, batch, augment, seed, state=None):
+    """state["mosaic"] = probabilidade de usar mosaico (o laço de treino muda no fim do treino)."""
     rng = np.random.default_rng(seed)
+    state = state if state is not None else {"mosaic": 0.0}
 
     def gen():
         idx = np.arange(len(items))
         if augment:
             rng.shuffle(idx)
         for k in range(0, len(idx), batch):
-            xs, t3s, t4s = [], [], []
+            xs, ts = [], [[] for _ in STRIDES]
             for i in idx[k:k + batch]:
                 img, bn, _ = items[i]
-                if augment:
+                if augment and rng.random() < state["mosaic"]:
+                    others = rng.integers(0, len(items), 3)
+                    im, b = mosaic4(items, [i, *others], size, rng)
+                elif augment:
                     im, b = random_affine(img, bn, size, rng)
+                if augment:
                     im = hsv_jitter(im, rng)
                     if rng.random() < 0.1:
                         im = cv2.cvtColor(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
@@ -228,21 +288,33 @@ def batch_generator(items, size, anchors, batch, augment, seed):
                         im = cv2.GaussianBlur(im, (3, 3), 0)
                 else:
                     im, b = letterbox(img, bn, size)
-                t3, t4 = build_targets(b, size, anchors)
-                xs.append(to_input(im)); t3s.append(t3); t4s.append(t4)
-            yield np.stack(xs), np.stack(t3s), np.stack(t4s)
+                xs.append(to_input(im))
+                for lst, t in zip(ts, build_targets(b, size, anchors)):
+                    lst.append(t)
+            yield (np.stack(xs), *(np.stack(t) for t in ts))
 
-    n3 = (size // STRIDES[0]) ** 2 * NUM_ANCHORS
-    n4 = (size // STRIDES[1]) ** 2 * NUM_ANCHORS
     sig = (tf.TensorSpec((None, size, size, 3), tf.float32),
-           tf.TensorSpec((None, n3, 5), tf.float32),
-           tf.TensorSpec((None, n4, 5), tf.float32))
+           *(tf.TensorSpec((None, (size // s) ** 2 * NUM_ANCHORS, 5), tf.float32) for s in STRIDES))
     return tf.data.Dataset.from_generator(gen, output_signature=sig).prefetch(2)
 
 
 # =========================================================================== #
 # Modelo
 # =========================================================================== #
+class Upsample2x(layers.Layer):
+    """Upsampling 2x 'nearest' que vira um único RESIZE_NEAREST_NEIGHBOR no TFLite.
+    O layers.UpSampling2D do Keras 3 vira ExpandDims + TILE + Reshape 5D: o TILE
+    não existe no firmware do Grove Vision AI V2 e tensores 5D não rodam na NPU."""
+
+    def call(self, x):
+        h, w = x.shape[1], x.shape[2]
+        return tf.compat.v1.image.resize_nearest_neighbor(
+            x, (2 * h, 2 * w), align_corners=False, half_pixel_centers=False)
+
+    def compute_output_shape(self, s):
+        return (s[0], 2 * s[1], 2 * s[2], s[3])
+
+
 def conv_bn(x, f, k=1, s=1):
     x = layers.Conv2D(f, k, strides=s, padding="same", use_bias=False)(x)
     x = layers.BatchNormalization()(x)
@@ -257,8 +329,81 @@ def dw_block(x, f):
     return conv_bn(x, f, 1)
 
 
-def build_train_model(size, alpha=0.35, pretrained=True):
+# --------------------------------------------------------------------------- #
+# Swift-YOLO (Seeed SSCMA): YOLOv5 com CSPDarknet + PAFPN, ReLU e largura reduzida
+# Referência: ModelAssistant/configs/swift_yolo/swift_yolo_tiny_1xb16_300e_coco.py
+# --------------------------------------------------------------------------- #
+def make_div(c, widen, divisor=8):
+    return int(math.ceil(c * widen / divisor) * divisor)
+
+
+def make_round(n, deepen):
+    return max(round(n * deepen), 1) if n > 1 else n
+
+
+def cbr(x, f, k=1, s=1):
+    """ConvModule do SSCMA: Conv (sem bias) + BatchNorm (momentum 0.03 do PyTorch) + ReLU."""
+    x = layers.Conv2D(f, k, strides=s, padding="same", use_bias=False)(x)
+    x = layers.BatchNormalization(momentum=0.97, epsilon=1e-3)(x)
+    return layers.ReLU()(x)
+
+
+def darknet_bottleneck(x, c, add):
+    y = cbr(cbr(x, c, 1), c, 3)
+    return layers.Add()([x, y]) if add else y
+
+
+def csp_layer(x, out, n, add):
+    """CSPLayer (C3 do YOLOv5): dois ramos 1x1, gargalos no ramo principal, concat e 1x1."""
+    mid = int(out * 0.5)
+    short = cbr(x, mid, 1)
+    main = cbr(x, mid, 1)
+    for _ in range(n):
+        main = darknet_bottleneck(main, mid, add)
+    return cbr(layers.Concatenate()([main, short]), out, 1)
+
+
+def sppf(x, out):
+    mid = x.shape[-1] // 2
+    x = cbr(x, mid, 1)
+    y1 = layers.MaxPool2D(5, strides=1, padding="same")(x)
+    y2 = layers.MaxPool2D(5, strides=1, padding="same")(y1)
+    y3 = layers.MaxPool2D(5, strides=1, padding="same")(y2)
+    return cbr(layers.Concatenate()([x, y1, y2, y3]), out, 1)
+
+
+def swift_yolo_features(x, widen=0.15, deepen=0.33):
+    """Backbone YOLOv5CSPDarknet (P5) + neck YOLOv5PAFPN. Retorna (p3, p4, p5)."""
+    # backbone
+    x = cbr(x, make_div(64, widen), 6, 2)                          # stem 6x6/2
+    feats = []
+    for c_out, n, spp in ((128, 3, False), (256, 6, False), (512, 9, False), (1024, 3, True)):
+        c = make_div(c_out, widen)
+        x = cbr(x, c, 3, 2)
+        x = csp_layer(x, c, make_round(n, deepen), add=True)
+        if spp:
+            x = sppf(x, c)
+        feats.append(x)
+    c3, c4, c5 = feats[1:]                                          # strides 8, 16, 32
+    ch = [make_div(c, widen) for c in (256, 512, 1024)]
+    n = make_round(3, deepen)
+
+    # top-down
+    r5 = cbr(c5, ch[1], 1)
+    t4 = csp_layer(layers.Concatenate()([Upsample2x()(r5), c4]), ch[1], n, add=False)
+    t4 = cbr(t4, ch[0], 1)
+    p3 = csp_layer(layers.Concatenate()([Upsample2x()(t4), c3]), ch[0], n, add=False)
+    # bottom-up
+    p4 = csp_layer(layers.Concatenate()([cbr(p3, ch[0], 3, 2), t4]), ch[1], n, add=False)
+    p5 = csp_layer(layers.Concatenate()([cbr(p4, ch[1], 3, 2), r5]), ch[2], n, add=False)
+    return p3, p4, p5
+
+
+def build_train_model(size, alpha=0.35, pretrained=True, arch="swift", widen=0.15, deepen=0.33):
     inp = keras.Input((size, size, 3), name="image")          # RGB 0..1
+    if arch == "swift":
+        p3, p4, p5 = swift_yolo_features(inp, widen, deepen)
+        return _add_heads(inp, (p3, p4, p5), size, "swift_yolo_placas")
     x = layers.Rescaling(2.0, offset=-1.0)(inp)               # MobileNetV2 espera -1..1
     weights = "imagenet" if pretrained else None
     bb = keras.applications.MobileNetV2(input_shape=(size, size, 3), include_top=False,
@@ -268,20 +413,26 @@ def build_train_model(size, alpha=0.35, pretrained=True):
     c3, c4, c5 = feats(x)                                     # strides 8, 16, 32
 
     p5 = conv_bn(c5, 96, 1)
-    p4 = layers.Concatenate()([conv_bn(c4, 64, 1), layers.UpSampling2D(2, interpolation="nearest")(p5)])
+    # nomes iguais aos do UpSampling2D antigo, para os pesos já treinados continuarem carregando
+    p4 = layers.Concatenate()([conv_bn(c4, 64, 1), Upsample2x(name="up_sampling2d")(p5)])
     p4 = dw_block(dw_block(p4, 96), 96)
     p3 = layers.Concatenate()([conv_bn(c3, 32, 1),
-                               layers.UpSampling2D(2, interpolation="nearest")(conv_bn(p4, 48, 1))])
+                               Upsample2x(name="up_sampling2d_1")(conv_bn(p4, 48, 1))])
     p3 = dw_block(dw_block(p3, 64), 64)
+    p5 = dw_block(p5, 96)
+    return _add_heads(inp, (p3, p4, p5), size, "yolo_tiny_placas")
 
-    h3 = layers.Conv2D(NUM_ANCHORS * NO, 1, name="head_p3")(p3)
-    h4 = layers.Conv2D(NUM_ANCHORS * NO, 1, name="head_p4")(p4)
-    r3 = layers.Reshape((-1, NO), name="raw_p3")(h3)          # [B, G*G*A, 6]
-    r4 = layers.Reshape((-1, NO), name="raw_p4")(h4)
-    model = keras.Model(inp, [r3, r4], name="yolo_tiny_placas")
+
+def _add_heads(inp, feats, size, name):
+    """Cabeça YOLOv5 (DetHead): uma conv 1x1 por escala com 3 âncoras x (5 + classes)."""
+    raws = []
+    for lvl, feat in zip((3, 4, 5), feats):
+        h = layers.Conv2D(NUM_ANCHORS * NO, 1, name=f"head_p{lvl}")(feat)
+        raws.append(layers.Reshape((-1, NO), name=f"raw_p{lvl}")(h))   # [B, G*G*A, 6]
+    model = keras.Model(inp, raws, name=name)
 
     # Viés inicial do YOLOv5: poucas células com objeto no começo do treino
-    for name, s in (("head_p3", STRIDES[0]), ("head_p4", STRIDES[1])):
+    for name, s in zip(("head_p3", "head_p4", "head_p5"), STRIDES):
         l = model.get_layer(name)
         w, b = l.get_weights()
         b = b.reshape(NUM_ANCHORS, NO)
@@ -293,7 +444,7 @@ def build_train_model(size, alpha=0.35, pretrained=True):
 
 class YoloDecode(layers.Layer):
     """Decodifica a saída crua de uma escala para cx,cy,w,h normalizados + obj + cls.
-    Usa só sigmoid, multiplicação e soma (tudo int8 e rodando na NPU)."""
+    Usa só sigmoid, multiplicação, soma e concatenação (tudo int8)."""
 
     def __init__(self, stride, anchors, size, **kw):
         super().__init__(**kw)
@@ -308,7 +459,8 @@ class YoloDecode(layers.Layer):
     def call(self, raw):
         p = ops.sigmoid(raw)
         xy = (p[..., 0:2] * 2.0 - 0.5 + self.grid) * (self.stride / self.size)
-        wh = ops.square(p[..., 2:4] * 2.0) * (self.anc / self.size)
+        t = p[..., 2:4] * 2.0
+        wh = (t * t) * (self.anc / self.size)   # MUL em vez de SQUARE: SQUARE não tem versão int8
         return ops.concatenate([xy, wh, p[..., 4:]], axis=-1)
 
     def get_config(self):
@@ -316,11 +468,11 @@ class YoloDecode(layers.Layer):
 
 
 def build_export_model(train_model, anchors, size):
-    r3, r4 = train_model.outputs
-    d3 = YoloDecode(STRIDES[0], anchors[0], size, name="decode_p3")(r3)
-    d4 = YoloDecode(STRIDES[1], anchors[1], size, name="decode_p4")(r4)
-    out = layers.Concatenate(axis=1, name="detections")([d3, d4])   # [B, N, 6]
-    return keras.Model(train_model.input, out, name="yolo_tiny_placas_export")
+    decoded = [YoloDecode(s, anchors[i], size, name=f"decode_p{i + 3}")(r)
+               for i, (s, r) in enumerate(zip(STRIDES, train_model.outputs))]
+    # [B, N, 6] com N = ((S/8)^2 + (S/16)^2 + (S/32)^2) * 3, o formato YOLOv5 do firmware
+    out = layers.Concatenate(axis=1, name="detections")(decoded)
+    return keras.Model(train_model.input, out, name=f"{train_model.name}_export")
 
 
 # =========================================================================== #
@@ -351,7 +503,7 @@ class YoloLoss:
             grid = np.stack([gx, gy], -1).reshape(G * G, 1, 2).repeat(NUM_ANCHORS, 1).reshape(-1, 2)
             anc = np.tile(anchors[si] / s, (G * G, 1))
             self.levels.append((tf.constant(grid, tf.float32), tf.constant(anc, tf.float32)))
-        self.balance = [4.0, 1.0]
+        self.balance = [4.0, 1.0, 0.4]
         self.box_gain = 0.05 * 3 / nl
         self.obj_gain = 1.0 * (size / 640) ** 2 * 3 / nl
         self.cls_gain = 0.5 * NC / 80 * 3 / nl
@@ -483,9 +635,15 @@ def export_tflite(export_model, rep_items, size, out_dir: Path, n_rep=200):
     def serve(x):
         return export_model(x, training=False)
 
-    concrete = serve.get_concrete_function()
+    # Congela os pesos como constantes. Sem isso o Keras 3 deixa os pesos como
+    # variáveis (READ_VARIABLE) e a calibração int8 falha.
+    from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+    concrete = convert_variables_to_constants_v2(serve.get_concrete_function())
 
-    conv = tf.lite.TFLiteConverter.from_concrete_functions([concrete], export_model)
+    def new_converter():
+        return tf.lite.TFLiteConverter.from_concrete_functions([concrete])
+
+    conv = new_converter()
     f32 = out_dir / "placas_float32.tflite"
     f32.write_bytes(conv.convert())
 
@@ -498,7 +656,7 @@ def export_tflite(export_model, rep_items, size, out_dir: Path, n_rep=200):
             canvas, _ = letterbox(img, bn, size)
             yield [to_input(canvas)[None]]
 
-    conv = tf.lite.TFLiteConverter.from_concrete_functions([concrete], export_model)
+    conv = new_converter()
     conv.optimizations = [tf.lite.Optimize.DEFAULT]
     conv.representative_dataset = representative
     conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
@@ -511,15 +669,50 @@ def export_tflite(export_model, rep_items, size, out_dir: Path, n_rep=200):
     return f32, i8
 
 
-def run_vela(tflite: Path, out_dir: Path, accelerator: str):
-    if shutil.which("vela") is None:
-        print("[vela] 'vela' não encontrado. Instale com: pip install ethos-u-vela")
+# Configuração de memória do Grove Vision AI V2 publicada pela Seeed:
+# pesos na flash externa (Axi1) e ativações na SRAM (Axi0).
+VELA_CONFIG = """\
+[System_Config.My_Sys_Cfg]
+core_clock=400e6
+axi0_port=Sram
+axi1_port=OffChipFlash
+Sram_clock_scale=1.0
+Sram_burst_length=32
+Sram_read_latency=16
+Sram_write_latency=16
+Dram_clock_scale=0.75
+Dram_burst_length=128
+Dram_read_latency=500
+Dram_write_latency=250
+OnChipFlash_clock_scale=0.25
+OffChipFlash_clock_scale=0.015625
+OffChipFlash_burst_length=32
+OffChipFlash_read_latency=64
+OffChipFlash_write_latency=64
+
+[Memory_Mode.My_Mem_Mode_Parent]
+const_mem_area=Axi1
+arena_mem_area=Axi0
+cache_mem_area=Axi0
+"""
+
+
+def run_vela(tflite: Path, out_dir: Path, accelerator: str, vela_bin: str = "vela"):
+    if shutil.which(vela_bin) is None:
+        print(f"[vela] '{vela_bin}' não encontrado. Rode o Vela à mão (veja vela_config.ini).")
         return None
     vout = out_dir / "vela_out"
     vout.mkdir(parents=True, exist_ok=True)
-    cmd = ["vela", "--accelerator-config", accelerator, "--output-dir", str(vout), str(tflite)]
+    cfg = out_dir / "vela_config.ini"
+    cfg.write_text(VELA_CONFIG)
+    cmd = [vela_bin, "--accelerator-config", accelerator,
+           "--config", str(cfg), "--system-config", "My_Sys_Cfg", "--memory-mode", "My_Mem_Mode_Parent",
+           "--output-dir", str(vout), str(tflite)]
     print("[vela]", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    if subprocess.run(cmd).returncode != 0:
+        print("[vela] O Vela falhou. O .tflite int8 foi salvo; rode o Vela 3.12 num ambiente com Python 3.12 e numpy<2:")
+        print("       python train_tf.py ... --skip-train --vela .venv-vela/bin/vela")
+        return None
     vf = vout / f"{tflite.stem}_vela.tflite"
     print(f"[vela] Modelo para o Grove Vision AI V2: {vf}")
     return vf
@@ -534,7 +727,13 @@ def parse_args():
     p.add_argument("--data-dir", default="datasets/placas", help="dataset no formato YOLO (images|labels/train|val)")
     p.add_argument("--val", type=float, default=0.2, help="fração de validação na conversão VOC")
     p.add_argument("--imgsz", type=int, default=192, help="entrada (múltiplo de 32: 160, 192, 224, 256)")
-    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--arch", choices=("swift", "mobilenet"), default="swift",
+                   help="swift = Swift-YOLO da Seeed (CSPDarknet+PAFPN); mobilenet = MobileNetV2 pré-treinado")
+    p.add_argument("--width", type=float, default=0.15, help="widen_factor da Swift-YOLO (tiny = 0.15)")
+    p.add_argument("--depth", type=float, default=0.33, help="deepen_factor da Swift-YOLO (tiny = 0.33)")
+    p.add_argument("--mosaic", type=float, default=0.8, help="probabilidade de mosaico no treino (0 desliga)")
+    p.add_argument("--close-mosaic", type=int, default=15, help="desliga o mosaico nas últimas N épocas")
+    p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--lr", type=float, default=2e-3)
     p.add_argument("--warmup", type=int, default=3, help="épocas de aquecimento do learning rate")
@@ -545,6 +744,8 @@ def parse_args():
     p.add_argument("--skip-train", action="store_true", help="só exportar usando best.weights.h5 de --out")
     p.add_argument("--rep-samples", type=int, default=200, help="imagens para calibrar a quantização int8")
     p.add_argument("--accelerator", default="ethos-u55-64", help="configuração da NPU do Grove Vision AI V2")
+    p.add_argument("--vela", default="vela",
+                   help="executável do Vela (ex.: .venv-vela/bin/vela, com ethos-u-vela==3.12.0 e numpy<2)")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -583,14 +784,25 @@ def main():
 
     anchors_path = out / "anchors.json"
     if args.skip_train and anchors_path.exists():
-        anchors = np.array(json.loads(anchors_path.read_text())["anchors"], np.float32)
+        meta = json.loads(anchors_path.read_text())
+        anchors = np.array(meta["anchors"], np.float32)
+        # usa a mesma arquitetura com que os pesos foram treinados
+        # (pastas antigas, sem "arch", são do MobileNetV2)
+        args.arch = meta.get("arch", "mobilenet")
+        args.width, args.depth = meta.get("width", args.width), meta.get("depth", args.depth)
+        args.alpha = meta.get("alpha", args.alpha)
     else:
         anchors = kmeans_anchors(train_items, args.imgsz)
         anchors_path.write_text(json.dumps({"imgsz": args.imgsz, "strides": STRIDES,
-                                            "anchors": anchors.round(2).tolist()}, indent=2))
+                                            "anchors": anchors.round(2).tolist(),
+                                            "arch": args.arch, "width": args.width, "depth": args.depth,
+                                            "alpha": args.alpha}, indent=2))
     print(f"[âncoras] stride 8: {anchors[0].round(1).tolist()} | stride 16: {anchors[1].round(1).tolist()}")
 
-    model = build_train_model(args.imgsz, args.alpha, pretrained=not args.no_pretrained)
+    model = build_train_model(args.imgsz, args.alpha, pretrained=not args.no_pretrained,
+                              arch=args.arch, widen=args.width, deepen=args.depth)
+    print(f"[modelo] arquitetura: {args.arch}" +
+          (f" (widen {args.width}, deepen {args.depth})" if args.arch == "swift" else f" (alpha {args.alpha})"))
     export_model = build_export_model(model, anchors, args.imgsz)
     print(f"[modelo] {model.count_params() / 1e6:.2f} M parâmetros")
     best_path = out / "best.weights.h5"
@@ -598,14 +810,16 @@ def main():
     if not args.skip_train:
         loss_fn = YoloLoss(anchors, args.imgsz)
         opt = keras.optimizers.AdamW(learning_rate=args.lr, weight_decay=5e-4, clipnorm=10.0)
-        ds = batch_generator(train_items, args.imgsz, anchors, args.batch, augment=True, seed=args.seed)
+        aug_state = {"mosaic": args.mosaic}
+        ds = batch_generator(train_items, args.imgsz, anchors, args.batch, augment=True, seed=args.seed,
+                             state=aug_state)
         steps = math.ceil(len(train_items) / args.batch)
 
         @tf.function(reduce_retracing=True)
-        def train_step(x, t3, t4):
+        def train_step(x, *targets):
             with tf.GradientTape() as tape:
-                r3, r4 = model(x, training=True)
-                loss, parts = loss_fn([r3, r4], [t3, t4])
+                preds = model(x, training=True)
+                loss, parts = loss_fn(list(preds), list(targets))
             grads = tape.gradient(loss, model.trainable_variables)
             opt.apply_gradients(zip(grads, model.trainable_variables))
             return loss, parts
@@ -622,11 +836,14 @@ def main():
                     t = (ep - args.warmup) / max(1, args.epochs - args.warmup)
                     lr = args.lr * (0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * t)))
                 opt.learning_rate = lr
+                if ep == args.epochs - args.close_mosaic + 1 and aug_state["mosaic"] > 0:
+                    aug_state["mosaic"] = 0.0
+                    print("[treino] mosaico desligado nas últimas épocas (ajuste fino com imagens inteiras)")
 
                 t0 = time.time()
                 tot, parts_sum, n = 0.0, np.zeros(3), 0
-                for x, t3, t4 in ds:
-                    loss, parts = train_step(x, t3, t4)
+                for x, *targets in ds:
+                    loss, parts = train_step(x, *targets)
                     tot += float(loss); parts_sum += parts.numpy(); n += 1
                 tot /= max(n, 1); parts_sum /= max(n, 1)
 
@@ -655,7 +872,7 @@ def main():
                      ("TFLite int8", tflite_predict_fn(i8))):
         ap, p, r = evaluate(fn, val_items, args.imgsz)
         print(f"[val] {name:15s} mAP50 {ap:.3f} | P {p:.3f} | R {r:.3f}")
-    run_vela(i8, out, args.accelerator)
+    run_vela(i8, out, args.accelerator, args.vela)
 
 
 if __name__ == "__main__":
