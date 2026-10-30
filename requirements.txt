@@ -1,6 +1,27 @@
-ultralytics>=8.3
+# ----------------------------------------------------------------------------
+# Treino em TensorFlow/Keras (train_tf.py) -> TFLite int8 -> Vela
+#
+# Instalação (num ambiente virtual novo, Python 3.10 a 3.12):
+#   python -m venv .venv
+#   Linux:   source .venv/bin/activate      Windows:  .venv\Scripts\activate
+#   python -m pip install --upgrade pip
+#   python -m pip install --no-cache-dir -r requirements.txt
+#
+# "--no-cache-dir" evita que o pip guarde uma cópia extra dos pacotes no disco
+# (ajuda com o erro "[Errno 122] Disk quota exceeded").
+#
+# --- GPU AMD (RX 9070) ------------------------------------------------------
+# O TensorFlow só usa GPU AMD no LINUX, com o ROCm 7.2.1 instalado no sistema.
+# No Windows ele roda apenas na CPU (o modelo é pequeno, então dá para treinar assim).
+# Ubuntu 24.04 + Python 3.12, depois de instalar este arquivo:
+#   pip uninstall -y tensorflow
+#   pip install --no-cache-dir https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/tensorflow_rocm-2.20.0.dev0%2Bselfbuilt-cp312-cp312-manylinux_2_28_x86_64.whl
+# Verificação:
+#   python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+# ----------------------------------------------------------------------------
+
+tensorflow   # Keras 3 incluso; treino, conversão TFLite e interpretador
 opencv-python
 numpy
-tensorflow      # usado pelo export TFLite e como interpretador no PC
-ethos-u-vela    # otimização para a NPU Ethos-U55 do Grove Vision AI V2
-kaggle          # opcional: baixar o dataset car-plate-detection pela linha de comando
+ethos-u-vela             # otimização para a NPU Ethos-U55 do Grove Vision AI V2
+kaggle                   # opcional: baixar o dataset car-plate-detection
